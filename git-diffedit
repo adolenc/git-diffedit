@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+#
+# git-diffedit — edit your unstaged diff in your editor; the saved buffer
+# becomes your new unstaged diff.
+#
+# You are mid-change and realize the identifier you have been typing all
+# morning wants a different name. diffedit opens your unstaged changes as
+# one patch, you edit the '+' lines (e.g. :g/^+/s/old/new/g), save, and the
+# working tree is rewritten so that `git diff` now shows exactly the saved
+# patch. Quitting without saving aborts; HEAD and the index are never
+# touched.
+#
+# Dependency-free by design: bash + sed + awk + git, i.e. it runs anywhere
+# git itself runs (Git for Windows bundles all of these; macOS has them).
+#
+# No fuzz, ever: every apply is strict. The edited patch is replayed against
+# pre-change copies of the files in a temp dir, and only the difference
+# between the old and the new result lands in your tree: a failed apply
+# writes nothing and reopens your editor, and files whose hunks you did not
+# touch are never rewritten.
+
+set -u
+
+PROG=git-diffedit
+
+die()  { printf '%s: %s\n' "$PROG" "$2" >&2; exit "$1"; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+say()  { [ -n "$QUIET" ] || printf '%s\n' "$*"; }
+
+usage() {
+	cat <<'EOF'
+usage: git diffedit [options] [--] [<pathspec>...]
+
+Open the unstaged diff (working tree vs index) as a patch in your editor.
+Save, and the working tree is rewritten so its unstaged diff IS the saved
+patch; quit without saving (:q!) to abort. HEAD and the index are never
+touched.
+
+options
+  -U, --unified N  context lines around each change (default 3, minimum 1);
+                   the context anchors the strict apply, more is safer
+  -q, --quiet      suppress the report
+  -h, --help       this
+
+In the editor: edit or add '+' lines freely; delete a '+' line to drop that
+addition. Turn a '-' into a ' ' to keep that line after all, or a ' ' into
+'-' to also delete it; never delete or reword '-'/' ' lines otherwise (they
+must keep matching the pre-change file). Deleting a whole hunk or file
+section REVERTS that change from your working tree; the pre-edit diff is
+saved so nothing is lost. Lines starting with '#' are ignored. An empty
+buffer, or quitting without saving, aborts. Failed applies write nothing
+and reopen the editor with git's error message.
+
+Untracked files do not show up in the unstaged diff; `git add -N <file>`
+makes one appear as an editable new-file section. Binary, submodule and
+symlink changes are left untouched (noted in the buffer).
+EOF
+	exit 0
+}
+
+# ---------------------------------------------------------------------------
+# args
+
+QUIET=; UCTX=3
+PATHSPEC=()
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+	-h|--help)   usage ;;
+	-U|--unified)
+		[ $# -ge 2 ] || die 3 "$1 needs an argument"
+		UCTX=$2; shift ;;
+	-U*)         UCTX=${1#-U} ;;
+	--unified=*) UCTX=${1#--unified=} ;;
+	-q|--quiet)  QUIET=1 ;;
+	--)          shift; while [ $# -gt 0 ]; do PATHSPEC[${#PATHSPEC[@]}]=$1; shift; done; break ;;
+	-*)          die 3 "unknown option: $1 (try --help)" ;;
+	*)           die 3 "unexpected argument: $1 (diffedit always edits the unstaged diff; try --help)" ;;
+	esac
+	shift
+done
+
+case "$UCTX" in ''|*[!0-9]*) die 3 "--unified needs a number: '$UCTX'" ;; esac
+[ "$UCTX" -ge 1 ] || die 3 "--unified must be at least 1: the context lines anchor the strict apply"
+
+# ---------------------------------------------------------------------------
+# environment
+
+git rev-parse --git-dir >/dev/null 2>&1 || die 3 "not a git repository"
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die 3 "this command needs a work tree"
+GITDIR=$(git rev-parse --absolute-git-dir)
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/diffedit.XXXXXX") || die 3 "cannot create temp dir"
+trap 'rm -rf "$TMP"' EXIT
+
+BUFFER=$GITDIR/DIFFEDIT_EDIT.diff  # .diff so editors pick the right syntax
+ORIG=$GITDIR/DIFFEDIT_ORIG.diff    # the unstaged diff as it was before editing
+UNDO=$GITDIR/DIFFEDIT_UNDO.diff    # what landed in the tree; apply -R to undo
+
+# Config that would change the shape of generated patches out from under us.
+HARDEN=(-c color.ui=false -c core.quotePath=false -c diff.noprefix=false
+        -c diff.mnemonicPrefix=false -c diff.external= -c diff.relative=false
+        -c diff.suppressBlankEmpty=false)
+DIFFOPTS=(--patch --no-color --no-ext-diff --no-textconv --no-renames "-U$UCTX")
+
+# ---------------------------------------------------------------------------
+# 1. generate the unstaged diff
+
+git "${HARDEN[@]}" diff "${DIFFOPTS[@]}" \
+	${PATHSPEC[@]+--} ${PATHSPEC[@]+"${PATHSPEC[@]}"} > "$TMP/src.raw" \
+	|| die 3 "could not generate the unstaged diff"
+
+grep -q '^diff --cc ' "$TMP/src.raw" \
+	&& die 3 "unmerged paths in the working tree; resolve the conflicts first"
+grep -q '^diff --git ' "$TMP/src.raw" \
+	|| die 1 "no unstaged changes to edit (untracked files appear only after git add -N)"
+if grep -q '^--- "' "$TMP/src.raw" || grep -q '^+++ "' "$TMP/src.raw"; then
+	die 3 "a path in this diff needs quoting (special characters); not supported"
+fi
+
+# Drop file sections diffedit cannot do anything useful with (binary files,
+# submodule pointers, symlinks); they stay untouched in the working tree.
+awk -v NOTES="$TMP/notes" '
+	function flush() {
+		if (n == 0) return
+		if (drop != "") print "# note: left untouched (" drop "): " hdr > NOTES
+		else for (i = 1; i <= n; i++) print line[i]
+		n = 0; drop = ""
+	}
+	/^diff --git / { flush(); hdr = $0 }
+	{
+		line[++n] = $0
+		if ($0 ~ /^(Binary files |GIT binary patch)/) drop = "binary file"
+		if ($0 ~ /^(old|new|deleted file|new file) mode 160000/ || $0 ~ /^[+-]Subproject commit /) drop = "submodule"
+		if ($0 ~ /^(old|new|deleted file|new file) mode 120000/ || $0 ~ /^index [0-9a-f]+\.\.[0-9a-f]+ 120000$/) drop = "symlink"
+	}
+	END { flush() }
+' "$TMP/src.raw" > "$TMP/src.diff"
+
+grep -q '^diff --git ' "$TMP/src.diff" \
+	|| die 1 "nothing editable in the unstaged diff (only binary/submodule/symlink changes)"
+
+cp "$TMP/src.diff" "$ORIG"
+
+# ---------------------------------------------------------------------------
+# 2. reconstruct the pre-change files in a temp copy
+#
+# The buffer's pre-image is not the working tree but the tree *minus* the
+# unstaged changes (i.e. the index content of the touched paths). Copy the
+# touched files and strictly reverse-apply the diff we just generated; a
+# failure here means the tree changed between the diff and the copy.
+
+# paths touched by the (sanitized) diff
+awk '
+	/^--- a\// { p = substr($0, 7) } /^\+\+\+ b\// { p = substr($0, 7) }
+	/^(---|\+\+\+) / { if (p != "") { sub(/\t$/, "", p); if (!seen[p]++) print p; p = "" } }
+' "$TMP/src.diff" > "$TMP/paths"
+
+mkdir -p "$TMP/cur"
+while IFS= read -r p; do
+	[ -f "$TOP/$p" ] || continue        # deleted in the tree: reverse-apply recreates it
+	mkdir -p "$TMP/cur/$(dirname "$p")"
+	cp -p "$TOP/$p" "$TMP/cur/$p"
+done < "$TMP/paths"
+
+cp -pR "$TMP/cur" "$TMP/base"
+git -C "$TMP/base" apply -R --whitespace=nowarn "$TMP/src.diff" \
+	|| die 2 "internal: could not reconstruct the pre-change files (tree changed underneath us?)"
+
+# ---------------------------------------------------------------------------
+# 3. assemble the buffer, open the editor
+
+cp "$TMP/src.diff" "$TMP/body.diff"
+
+write_buffer() {  # $1 = path of an error file to quote, or ""
+	{
+		printf '# diffedit: unstaged changes (working tree vs index)\n# -> the saved buffer becomes your new unstaged diff\n'
+		if [ -n "$1" ] && [ -s "$1" ]; then
+			printf '#\n# APPLY FAILED -- git said:\n'
+			sed 's/^/#     /' "$1"
+			printf '# fix the patch below and save to retry; empty file aborts.\n'
+		fi
+		cat <<'EOF'
+#
+# Edit or add '+' lines freely; delete a '+' line to drop that addition.
+# Turn a '-' into a ' ' to keep that line after all, or a ' ' into '-' to
+# also delete it. Never delete or reword '-'/' ' lines otherwise: they must
+# keep matching the file as it was before your changes.
+# Deleting a whole hunk or file section REVERTS that change from your
+# working tree (the pre-edit diff is saved; see the final report).
+# '#' lines are ignored. Save and quit to rewrite the working tree; quit
+# without saving (:q!), or save an empty file, to abort.
+EOF
+		[ -s "$TMP/notes" ] && { printf '#\n'; cat "$TMP/notes"; }
+		cat "$TMP/body.diff"
+	} > "$BUFFER"
+}
+
+write_buffer ""
+
+EDITOR_CMD=$(git var GIT_EDITOR) || die 3 "no editor configured (core.editor / GIT_EDITOR / EDITOR)"
+# vim never writes an unmodified buffer on :x/ZZ, which would read as an
+# abort below; pre-dirty the buffer so any save-exit writes. Only -c can
+# do it: the stock ftplugin/diff.vim sets nomodeline on diff buffers.
+case "${EDITOR_CMD%% *}" in *vim) EDITOR_CMD="$EDITOR_CMD -c 'set modified'" ;; esac
+touch -t 200001010000 "$TMP/stamp"
+
+# ---------------------------------------------------------------------------
+# 4. edit -> recount -> strict apply onto the pre-image, with a retry loop
+#
+# The user's edits invalidate the @@ line counts, and `git apply --recount`
+# is not good enough: it fixes counts but leaves the +side start lines stale,
+# which misplaces every later hunk by the size of the edit. We recompute the
+# headers ourselves (start lines preserved, counts and +side starts rederived,
+# blank context lines restored to ' ', no-op hunks and empty sections dropped)
+# and then apply with no leniency flags at all.
+
+recount() {  # stdin: '#'-stripped patch, stdout: renumbered patch
+	awk '
+		function flushhunk(   b2, d2, c2) {
+			if (!inh) return
+			inh = 0
+			if (hadd + hdel == 0) return
+			b2 = hctx + hdel; d2 = hctx + hadd
+			if (b2 == 0) c2 = ha + delta + 1
+			else if (d2 == 0) c2 = ha + delta - 1
+			else c2 = ha + delta
+			secbuf = secbuf sprintf("@@ -%d,%d +%d,%d @@%s\n", ha, b2, c2, d2, htail) hbuf
+			seckept++
+			delta += hadd - hdel
+		}
+		function flushsec() {
+			flushhunk()
+			if (seckept > 0) printf "%s", sechdr secbuf
+			sechdr = ""; secbuf = ""; seckept = 0; delta = 0; insec = 0
+		}
+		/^diff --git / { flushsec(); insec = 1; inhead = 1; sechdr = $0 "\n"; next }
+		!insec { bad = 1; exit }
+		/^@@ / {
+			flushhunk(); inhead = 0; inh = 1
+			a = $2; sub(/^-/, "", a); sub(/,.*/, "", a); ha = a + 0
+			t = $0; sub(/^@@ [^@]*@@/, "", t); htail = t
+			hctx = 0; hadd = 0; hdel = 0; hbuf = ""
+			next
+		}
+		{
+			if (inhead) { sechdr = sechdr $0 "\n"; next }
+			if (!inh) { bad = 1; exit }
+			c = substr($0, 1, 1)
+			if ($0 == "")      { hbuf = hbuf " \n"; hctx++ }   # blank-stripped context line
+			else if (c == " ")  { hbuf = hbuf $0 "\n"; hctx++ }
+			else if (c == "-")  { hbuf = hbuf $0 "\n"; hdel++ }
+			else if (c == "+")  { hbuf = hbuf $0 "\n"; hadd++ }
+			else if (c == "\\") { hbuf = hbuf $0 "\n" }
+			else { bad = 1; exit }
+		}
+		END { if (bad) exit 65; flushsec() }
+	'
+}
+
+while :; do
+	# saving is the consent to apply: hand the editor a backdated buffer;
+	# an mtime still stuck in the past means the user quit without saving
+	touch -r "$TMP/stamp" "$BUFFER"
+	eval "$EDITOR_CMD" '"$BUFFER"' || die 2 "editor exited non-zero; nothing applied (buffer kept: $BUFFER)"
+	[ "$BUFFER" -nt "$TMP/stamp" ] || die 1 "buffer not saved, nothing applied"
+
+	grep -v '^#' "$BUFFER" > "$TMP/stripped"
+	if ! grep -q '^@@ ' "$TMP/stripped"; then
+		die 1 "empty patch aborts; refusing to revert all unstaged changes (git restore does that), nothing applied"
+	fi
+	recount < "$TMP/stripped" > "$TMP/final.diff" \
+		|| die 3 "unparsable patch (stray line outside a hunk?); buffer kept: $BUFFER"
+	grep -q '^@@ ' "$TMP/final.diff" \
+		|| die 1 "the edited diff is empty; refusing to revert all unstaged changes (git restore does that), nothing applied"
+
+	rm -rf "$TMP/new"; cp -pR "$TMP/base" "$TMP/new"
+	if git -C "$TMP/new" apply --whitespace=nowarn "$TMP/final.diff" 2>"$TMP/apply.err"; then
+		break
+	fi
+
+	# preserve the user's edits under a fresh header carrying the error
+	cp "$TMP/stripped" "$TMP/body.diff"
+	write_buffer "$TMP/apply.err"
+done
+
+# ---------------------------------------------------------------------------
+# 5. land only the difference between the old and the new result
+#
+# cur/ is the tree as it stands, new/ is pre-image + edited patch. Their
+# diff is exactly what must change in the working tree: hunks the user did
+# not touch cancel out, deleted hunks/sections show up as reverts, and the
+# whole thing applies strictly or not at all.
+
+git -C "$TMP" "${HARDEN[@]}" diff --no-index --no-color --no-ext-diff --no-renames cur new > "$TMP/inter.raw"
+case $? in 0|1) ;; *) die 3 "internal: could not diff the edited result against the tree" ;; esac
+
+if ! grep -q '^diff --git ' "$TMP/inter.raw"; then
+	say "the diff was not changed; working tree untouched"
+	exit 0
+fi
+
+awk '
+	/^diff --git / { inhead = 1 }
+	inhead && /^@@ / { inhead = 0 }
+	inhead {
+		gsub(/ a\/cur\//, " a/"); gsub(/ b\/cur\//, " b/")
+		gsub(/ a\/new\//, " a/"); gsub(/ b\/new\//, " b/")
+	}
+	{ print }
+' "$TMP/inter.raw" > "$TMP/inter.diff"
+
+if ! git -C "$TOP" apply --whitespace=nowarn "$TMP/inter.diff" 2>"$TMP/apply2.err"; then
+	warn "the working tree changed while you were editing; nothing applied:"
+	sed 's/^/    /' "$TMP/apply2.err" >&2
+	die 2 "rerun git diffedit to pick up the current state (buffer kept: $BUFFER)"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. report
+
+cp "$TMP/inter.diff" "$UNDO"
+
+say "diffedit: working tree rewritten"
+if [ -z "$QUIET" ]; then
+	git -C "$TOP" apply --stat "$TMP/inter.diff" | sed 's/^/  /'
+	printf '  review: git diff        undo: git apply -R %s\n' "$UNDO"
+	printf '  pre-edit diff saved at: %s\n' "$ORIG"
+fi
+exit 0
