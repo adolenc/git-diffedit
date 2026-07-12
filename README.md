@@ -34,6 +34,7 @@ chmod +x /usr/local/bin/git-diffedit
 
 ```
 git diffedit [options] [--] [<pathspec>...]
+git diffedit undo [-q]
 
 options
   -U, --unified N  context lines around each change (default 3, minimum 1);
@@ -48,9 +49,10 @@ into `-` to also delete it; never delete or reword `-`/`' '` lines otherwise
 section *reverts* that change from your working tree. Lines starting with
 `#` are ignored. An empty buffer, or quitting without saving, aborts.
 
-Nothing is more than one command from recovery: the pre-edit diff is saved
-to `.git/DIFFEDIT_ORIG.diff` and the applied delta to
-`.git/DIFFEDIT_UNDO.diff` (`git apply -R` it to undo).
+Nothing is more than one command from recovery: `git diffedit undo` takes
+back the last landed edit (strictly -- it refuses if the tree was edited
+since). The pre-edit diff is also saved to `.git/DIFFEDIT_ORIG.diff` and
+the applied delta to `.git/DIFFEDIT_UNDO.diff`.
 
 ## Examples
 
@@ -63,7 +65,7 @@ git diffedit -- src/
 
 # review what landed, or take it back
 git diff
-git apply -R .git/DIFFEDIT_UNDO.diff
+git diffedit undo
 ```
 
 ## Caveats

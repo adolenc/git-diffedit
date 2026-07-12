@@ -108,7 +108,7 @@ is "drop hunk: first insert kept" "$(line "$WORK/t4/g.txt" 5)" "foo_a = 1"
 is "drop hunk: second insert reverted" "$(grep -c foo_b "$WORK/t4/g.txt")" 0
 grep -q '+foo_b = 1' "$WORK/t4/.git/DIFFEDIT_ORIG.diff" \
 	&& ok "drop hunk: reverted hunk kept in ORIG" || bad "drop hunk: reverted hunk kept in ORIG"
-( cd "$WORK/t4" && git apply -R .git/DIFFEDIT_UNDO.diff )
+( cd "$WORK/t4" && "$TOOL" undo -q )
 is "drop hunk: undo restores the pre-edit diff" "$(git -C "$WORK/t4" diff)" "$before"
 
 # --- 5: editor deletes a '+' line; later hunk must still land exactly ----------
@@ -305,6 +305,32 @@ chmod +x "$WORK/fakebin/nvim"
 out=$( cd "$WORK/t20" && GIT_EDITOR="$WORK/fakebin/nvim" "$TOOL" 2>&1 )
 is "vim dirty: exit code" "$?" 0
 case "$out" in *"not changed"*) ok "vim dirty: unchanged save is a no-op" ;; *) bad "vim dirty: unchanged save is a no-op ($out)" ;; esac
+
+# --- 21: the undo subcommand ------------------------------------------------------
+
+make_wip "$WORK/t21"
+before=$(git -C "$WORK/t21" diff)
+( cd "$WORK/t21" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q )
+out=$( cd "$WORK/t21" && "$TOOL" undo )
+is "undo: exit code" "$?" 0
+case "$out" in *"undone"*) ok "undo: reported" ;; *) bad "undo: reported ($out)" ;; esac
+is "undo: pre-edit diff restored" "$(git -C "$WORK/t21" diff)" "$before"
+err=$( cd "$WORK/t21" && "$TOOL" undo -q 2>&1 )
+is "undo twice: exit code" "$?" 2
+case "$err" in *"already undone"*) ok "undo twice: explained" ;; *) bad "undo twice: explained ($err)" ;; esac
+is "undo twice: tree untouched" "$(git -C "$WORK/t21" diff)" "$before"
+( cd "$WORK/t21" && git apply .git/DIFFEDIT_UNDO.diff )
+is "redo: forward apply brings the edit back" "$(line "$WORK/t21/a.py" 3)" "bar_timeout = 5"
+err=$( cd "$WORK/t21" && "$TOOL" undo extra 2>&1 )
+is "undo extra args: refused" "$?" 3
+err=$( cd "$WORK/t21" && "$TOOL" -q undo 2>&1 )
+is "undo not first: refused" "$?" 3
+case "$err" in *"must come first"*) ok "undo not first: explained" ;; *) bad "undo not first: explained ($err)" ;; esac
+
+git init -q "$WORK/t21b"
+err=$( cd "$WORK/t21b" && "$TOOL" undo 2>&1 )
+is "undo nothing: exit code" "$?" 1
+case "$err" in *"nothing to undo"*) ok "undo nothing: explained" ;; *) bad "undo nothing: explained ($err)" ;; esac
 
 # ------------------------------------------------------------------------------
 

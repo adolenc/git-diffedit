@@ -8,7 +8,7 @@
 # one patch, you edit the '+' lines (e.g. :g/^+/s/old/new/g), save, and the
 # working tree is rewritten so that `git diff` now shows exactly the saved
 # patch. Quitting without saving aborts; HEAD and the index are never
-# touched.
+# touched, and `git diffedit undo` takes the landed edit back.
 #
 # Dependency-free by design: bash + sed + awk + git, i.e. it runs anywhere
 # git itself runs (Git for Windows bundles all of these; macOS has them).
@@ -30,11 +30,17 @@ say()  { [ -n "$QUIET" ] || printf '%s\n' "$*"; }
 usage() {
 	cat <<'EOF'
 usage: git diffedit [options] [--] [<pathspec>...]
+   or: git diffedit undo [-q]
 
 Open the unstaged diff (working tree vs index) as a patch in your editor.
 Save, and the working tree is rewritten so its unstaged diff IS the saved
 patch; quit without saving (:q!) to abort. HEAD and the index are never
 touched.
+
+git diffedit undo takes back the last landed edit: the applied delta is
+saved to .git/DIFFEDIT_UNDO.diff, and undo strictly reverse-applies it.
+It refuses if the tree no longer matches (already undone, or edited
+since); redo by applying the same file forward with git apply.
 
 options
   -U, --unified N  context lines around each change (default 3, minimum 1);
@@ -61,8 +67,20 @@ EOF
 # ---------------------------------------------------------------------------
 # args
 
-QUIET=; UCTX=3
+QUIET=; UCTX=3; MODE=edit
 PATHSPEC=()
+
+if [ "${1-}" = undo ]; then
+	MODE=undo; shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-h|--help)  usage ;;
+		-q|--quiet) QUIET=1 ;;
+		*)          die 3 "undo takes no arguments beyond -q: $1 (try --help)" ;;
+		esac
+		shift
+	done
+fi
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -75,6 +93,7 @@ while [ $# -gt 0 ]; do
 	-q|--quiet)  QUIET=1 ;;
 	--)          shift; while [ $# -gt 0 ]; do PATHSPEC[${#PATHSPEC[@]}]=$1; shift; done; break ;;
 	-*)          die 3 "unknown option: $1 (try --help)" ;;
+	undo)        die 3 "'undo' must come first: git diffedit undo" ;;
 	*)           die 3 "unexpected argument: $1 (diffedit always edits the unstaged diff; try --help)" ;;
 	esac
 	shift
@@ -95,7 +114,25 @@ trap 'rm -rf "$TMP"' EXIT
 
 BUFFER=$GITDIR/DIFFEDIT_EDIT.diff  # .diff so editors pick the right syntax
 ORIG=$GITDIR/DIFFEDIT_ORIG.diff    # the unstaged diff as it was before editing
-UNDO=$GITDIR/DIFFEDIT_UNDO.diff    # what landed in the tree; apply -R to undo
+UNDO=$GITDIR/DIFFEDIT_UNDO.diff    # what landed in the tree; 'diffedit undo' takes it back
+
+# ---------------------------------------------------------------------------
+# undo: strictly reverse-apply the last landed delta
+
+if [ "$MODE" = undo ]; then
+	[ -s "$UNDO" ] || die 1 "nothing to undo (no saved delta at $UNDO)"
+	if ! git -C "$TOP" apply -R --whitespace=nowarn "$UNDO" 2>"$TMP/undo.err"; then
+		warn "the working tree no longer matches what diffedit last wrote; nothing undone:"
+		sed 's/^/    /' "$TMP/undo.err" >&2
+		die 2 "already undone, or edited since (the delta is kept: $UNDO)"
+	fi
+	say "diffedit: last edit undone"
+	if [ -z "$QUIET" ]; then
+		git -C "$TOP" apply --stat "$UNDO" | sed 's/^/  /'
+		printf '  redo: git apply %s\n' "$UNDO"
+	fi
+	exit 0
+fi
 
 # Config that would change the shape of generated patches out from under us.
 HARDEN=(-c color.ui=false -c core.quotePath=false -c diff.noprefix=false
@@ -324,7 +361,7 @@ cp "$TMP/inter.diff" "$UNDO"
 say "diffedit: working tree rewritten"
 if [ -z "$QUIET" ]; then
 	git -C "$TOP" apply --stat "$TMP/inter.diff" | sed 's/^/  /'
-	printf '  review: git diff        undo: git apply -R %s\n' "$UNDO"
+	printf '  review: git diff        undo: git diffedit undo\n'
 	printf '  pre-edit diff saved at: %s\n' "$ORIG"
 fi
 exit 0
