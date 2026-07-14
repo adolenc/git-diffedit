@@ -332,6 +332,115 @@ err=$( cd "$WORK/t21b" && "$TOOL" undo 2>&1 )
 is "undo nothing: exit code" "$?" 1
 case "$err" in *"nothing to undo"*) ok "undo nothing: explained" ;; *) bad "undo nothing: explained ($err)" ;; esac
 
+# --- 22: --staged: rename lands in the index and the working tree ----------------
+
+make_wip "$WORK/t22"
+( cd "$WORK/t22" && git add -u )
+( cd "$WORK/t22" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q --staged )
+is "staged: exit code" "$?" 0
+is "staged: index rewritten" "$(git -C "$WORK/t22" show :a.py | sed -n 3p)" "bar_timeout = 5"
+is "staged: worktree matches" "$(line "$WORK/t22/a.py" 3)" "bar_timeout = 5"
+is "staged: second file too" "$(git -C "$WORK/t22" show :b.py | sed -n 3p)" "bar_timeout = 5"
+is "staged: no unstaged diff appears" "$(git -C "$WORK/t22" diff)" ""
+is "staged: HEAD untouched" "$(git -C "$WORK/t22" show HEAD:a.py | grep -c bar_)" 0
+
+# --- 23: --staged with unstaged changes elsewhere: unstaged diff preserved -------
+
+make_wip "$WORK/t23"
+( cd "$WORK/t23" && git add -u && printf 'unstaged_tail = 9\n' >> a.py )
+( cd "$WORK/t23" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q --staged )
+is "staged+wip: exit code" "$?" 0
+is "staged+wip: index rewritten" "$(git -C "$WORK/t23" show :a.py | sed -n 3p)" "bar_timeout = 5"
+is "staged+wip: tail not staged" "$(git -C "$WORK/t23" show :a.py | grep -c unstaged_tail)" 0
+is "staged+wip: worktree renamed too" "$(line "$WORK/t23/a.py" 3)" "bar_timeout = 5"
+is "staged+wip: tail kept in worktree" "$(tail -n1 "$WORK/t23/a.py")" "unstaged_tail = 9"
+is "staged+wip: unstaged diff still only the tail" \
+	"$(git -C "$WORK/t23" diff | grep -c '^+[^+]')" 1
+
+# --- 24: --staged refuses when unstaged edits overlap; nothing changes -----------
+
+make_wip "$WORK/t24"
+( cd "$WORK/t24" && git add -u && sedi 's/^foo_timeout = 5$/foo_timeout = 6/' a.py )
+idx_before=$(git -C "$WORK/t24" show :a.py)
+err=$( cd "$WORK/t24" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q --staged 2>&1 )
+is "staged overlap: exit code" "$?" 2
+case "$err" in *overlap*) ok "staged overlap: explained" ;; *) bad "staged overlap: explained ($err)" ;; esac
+is "staged overlap: index untouched" "$(git -C "$WORK/t24" show :a.py)" "$idx_before"
+is "staged overlap: worktree untouched" "$(line "$WORK/t24/a.py" 3)" "foo_timeout = 6"
+is "staged overlap: other file's index untouched" \
+	"$(git -C "$WORK/t24" show :b.py | sed -n 3p)" "foo_timeout = 5"
+
+# --- 25: undo after --staged restores the index and the working tree -------------
+
+make_wip "$WORK/t25"
+( cd "$WORK/t25" && git add -u && printf 'unstaged_tail = 9\n' >> a.py )
+idx_before=$(git -C "$WORK/t25" show :a.py)
+tree_before=$(cat "$WORK/t25/a.py")
+( cd "$WORK/t25" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q --staged )
+out=$( cd "$WORK/t25" && "$TOOL" undo )
+is "staged undo: exit code" "$?" 0
+is "staged undo: index restored" "$(git -C "$WORK/t25" show :a.py)" "$idx_before"
+is "staged undo: worktree restored" "$(cat "$WORK/t25/a.py")" "$tree_before"
+case "$out" in *"git apply --cached"*) ok "staged undo: redo hint covers the index" ;; \
+	*) bad "staged undo: redo hint covers the index ($out)" ;; esac
+err=$( cd "$WORK/t25" && "$TOOL" undo -q 2>&1 )
+is "staged undo twice: refused" "$?" 2
+is "staged undo twice: index untouched" "$(git -C "$WORK/t25" show :a.py)" "$idx_before"
+
+# --- 26: --staged: deleting a hunk reverts it from index AND worktree ------------
+
+git init -q "$WORK/t26" && ( cd "$WORK/t26" \
+	&& printf 'm1\nm2\nm3\nm4\nm5\nm6\nm7\nm8\nm9\nm10\nm11\nm12\nm13\nm14\nm15\nm16\nm17\nm18\nm19\nm20\n' > g.txt \
+	&& git add . && git commit -qm base \
+	&& ins after 'm4' 'foo_a = 1' g.txt \
+	&& ins after 'm12' 'foo_b = 1' g.txt \
+	&& git add -u )
+( cd "$WORK/t26" && GIT_EDITOR="$WORK/ed4" "$TOOL" -q --staged )
+is "staged drop: exit code" "$?" 0
+is "staged drop: first insert kept in index" "$(git -C "$WORK/t26" show :g.txt | grep -c foo_a)" 1
+is "staged drop: second gone from index" "$(git -C "$WORK/t26" show :g.txt | grep -c foo_b)" 0
+is "staged drop: second gone from worktree" "$(grep -c foo_b "$WORK/t26/g.txt")" 0
+
+# --- 27: --cached synonym with a pathspec; nothing staged refused ----------------
+
+make_wip "$WORK/t27"
+( cd "$WORK/t27" && git add -u )
+( cd "$WORK/t27" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q --cached -- a.py )
+is "cached pathspec: exit code" "$?" 0
+is "cached pathspec: a.py index edited" "$(git -C "$WORK/t27" show :a.py | sed -n 3p)" "bar_timeout = 5"
+is "cached pathspec: b.py index untouched" "$(git -C "$WORK/t27" show :b.py | sed -n 3p)" "foo_timeout = 5"
+
+make_wip "$WORK/t27b"
+err=$( cd "$WORK/t27b" && "$TOOL" -q --staged 2>&1 )
+is "nothing staged: exit code" "$?" 1
+case "$err" in *"no staged changes"*) ok "nothing staged: explained" ;; *) bad "nothing staged: explained ($err)" ;; esac
+
+# --- 28: an unstaged edit after a --staged one flips undo back to worktree-only --
+
+make_wip "$WORK/t28"
+( cd "$WORK/t28" && git add a.py )
+( cd "$WORK/t28" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q --staged )     # a.py: foo->bar
+idx_a=$(git -C "$WORK/t28" show :a.py)
+( cd "$WORK/t28" && GIT_EDITOR="$WORK/rename-ed" "$TOOL" -q )              # b.py: foo->bar
+( cd "$WORK/t28" && "$TOOL" undo -q )
+is "mode flip undo: exit code" "$?" 0
+is "mode flip undo: unstaged edit taken back" "$(line "$WORK/t28/b.py" 3)" "foo_timeout = 5"
+is "mode flip undo: staged edit untouched in index" "$(git -C "$WORK/t28" show :a.py)" "$idx_a"
+is "mode flip undo: staged edit untouched in worktree" "$(line "$WORK/t28/a.py" 3)" "bar_timeout = 5"
+
+# --- 29: --staged refuses on unmerged paths --------------------------------------
+
+git init -q "$WORK/t29" && ( cd "$WORK/t29" \
+	&& printf 'base\n' > c.txt && git add . && git commit -qm base \
+	&& git branch side \
+	&& printf 'ours\n' > c.txt && git commit -qam ours \
+	&& git checkout -q side && printf 'theirs\n' > c.txt && git commit -qam theirs \
+	&& git checkout -q - \
+	&& git merge side >/dev/null 2>&1 )
+err=$( cd "$WORK/t29" && "$TOOL" -q --staged 2>&1 )
+is "staged conflict: exit code" "$?" 3
+case "$err" in *unmerged*) ok "staged conflict: explained" ;; *) bad "staged conflict: explained ($err)" ;; esac
+
 # ------------------------------------------------------------------------------
 
 printf '\n%d tests, %d failed\n' "$N" "$FAILED"

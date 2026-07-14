@@ -10,6 +10,11 @@
 # patch. Quitting without saving aborts; HEAD and the index are never
 # touched, and `git diffedit undo` takes the landed edit back.
 #
+# --staged edits the staged diff (index vs HEAD) the same way: the saved
+# buffer becomes the new staged diff, and the edit lands in the working
+# tree too, so the files on disk keep matching what is staged and the
+# unstaged diff is preserved. Only HEAD is never touched then.
+#
 # Dependency-free by design: bash + sed + awk + git, i.e. it runs anywhere
 # git itself runs (Git for Windows bundles all of these; macOS has them).
 #
@@ -37,12 +42,20 @@ Save, and the working tree is rewritten so its unstaged diff IS the saved
 patch; quit without saving (:q!) to abort. HEAD and the index are never
 touched.
 
+With --staged, the buffer is the staged diff (index vs HEAD) and the saved
+patch becomes the new staged diff. The edit lands in the index AND the
+working tree, so the files on disk keep matching what is staged and the
+unstaged diff is preserved; if unstaged changes overlap the edited lines
+the apply refuses and writes nothing. HEAD is never touched.
+
 git diffedit undo takes back the last landed edit: the applied delta is
-saved to .git/DIFFEDIT_UNDO.diff, and undo strictly reverse-applies it.
-It refuses if the tree no longer matches (already undone, or edited
-since); redo by applying the same file forward with git apply.
+saved to .git/DIFFEDIT_UNDO.diff, and undo strictly reverse-applies it
+(from the index too after a --staged edit). It refuses if the tree no
+longer matches (already undone, or edited since); redo by applying the
+same file forward with git apply.
 
 options
+  --staged, --cached  edit the staged diff (index vs HEAD) instead
   -U, --unified N  context lines around each change (default 3, minimum 1);
                    the context anchors the strict apply, more is safer
   -q, --quiet      suppress the report
@@ -52,9 +65,9 @@ In the editor: edit or add '+' lines freely; delete a '+' line to drop that
 addition. Turn a '-' into a ' ' to keep that line after all, or a ' ' into
 '-' to also delete it; never delete or reword '-'/' ' lines otherwise (they
 must keep matching the pre-change file). Deleting a whole hunk or file
-section REVERTS that change from your working tree; the pre-edit diff is
-saved so nothing is lost. Lines starting with '#' are ignored. An empty
-buffer, or quitting without saving, aborts. Failed applies write nothing
+section REVERTS that change from your working tree (and the index with
+--staged); the pre-edit diff is saved so nothing is lost. Lines starting
+with '#' are ignored. An empty buffer, or quitting without saving, aborts. Failed applies write nothing
 and reopen the editor with git's error message.
 
 Untracked files do not show up in the unstaged diff; `git add -N <file>`
@@ -67,7 +80,7 @@ EOF
 # ---------------------------------------------------------------------------
 # args
 
-QUIET=; UCTX=3; MODE=edit
+QUIET=; UCTX=3; MODE=edit; STAGED=
 PATHSPEC=()
 
 if [ "${1-}" = undo ]; then
@@ -90,6 +103,7 @@ while [ $# -gt 0 ]; do
 		UCTX=$2; shift ;;
 	-U*)         UCTX=${1#-U} ;;
 	--unified=*) UCTX=${1#--unified=} ;;
+	--staged|--cached) STAGED=1 ;;
 	-q|--quiet)  QUIET=1 ;;
 	--)          shift; while [ $# -gt 0 ]; do PATHSPEC[${#PATHSPEC[@]}]=$1; shift; done; break ;;
 	-*)          die 3 "unknown option: $1 (try --help)" ;;
@@ -102,6 +116,10 @@ done
 case "$UCTX" in ''|*[!0-9]*) die 3 "--unified needs a number: '$UCTX'" ;; esac
 [ "$UCTX" -ge 1 ] || die 3 "--unified must be at least 1: the context lines anchor the strict apply"
 
+WHERE=unstaged; [ -n "$STAGED" ] && WHERE=staged
+REFUSE="refusing to revert all unstaged changes (git restore does that)"
+[ -n "$STAGED" ] && REFUSE="refusing to revert all staged changes"
+
 # ---------------------------------------------------------------------------
 # environment
 
@@ -113,15 +131,29 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/diffedit.XXXXXX") || die 3 "cannot create temp 
 trap 'rm -rf "$TMP"' EXIT
 
 BUFFER=$GITDIR/DIFFEDIT_EDIT.diff  # .diff so editors pick the right syntax
-ORIG=$GITDIR/DIFFEDIT_ORIG.diff    # the unstaged diff as it was before editing
+ORIG=$GITDIR/DIFFEDIT_ORIG.diff    # the edited diff as it was before editing
 UNDO=$GITDIR/DIFFEDIT_UNDO.diff    # what landed in the tree; 'diffedit undo' takes it back
+UNDO_STAGED=$GITDIR/DIFFEDIT_UNDO.staged  # exists iff the last landed edit was --staged
 
 # ---------------------------------------------------------------------------
 # undo: strictly reverse-apply the last landed delta
 
 if [ "$MODE" = undo ]; then
 	[ -s "$UNDO" ] || die 1 "nothing to undo (no saved delta at $UNDO)"
-	if ! git -C "$TOP" apply -R --whitespace=nowarn "$UNDO" 2>"$TMP/undo.err"; then
+	if [ -e "$UNDO_STAGED" ]; then
+		# a --staged edit landed in the index and the working tree; take it
+		# back from both, checking both first so a refusal undoes nothing
+		if ! { git -C "$TOP" apply -R --cached --check --whitespace=nowarn "$UNDO" \
+		    && git -C "$TOP" apply -R --check --whitespace=nowarn "$UNDO"; } 2>"$TMP/undo.err"; then
+			warn "the index or working tree no longer matches what diffedit last wrote; nothing undone:"
+			sed 's/^/    /' "$TMP/undo.err" >&2
+			die 2 "already undone, or edited since (the delta is kept: $UNDO)"
+		fi
+		if ! { git -C "$TOP" apply -R --cached --whitespace=nowarn "$UNDO" \
+		    && git -C "$TOP" apply -R --whitespace=nowarn "$UNDO"; }; then
+			die 3 "internal: undo failed after its --check passed (delta kept: $UNDO)"
+		fi
+	elif ! git -C "$TOP" apply -R --whitespace=nowarn "$UNDO" 2>"$TMP/undo.err"; then
 		warn "the working tree no longer matches what diffedit last wrote; nothing undone:"
 		sed 's/^/    /' "$TMP/undo.err" >&2
 		die 2 "already undone, or edited since (the delta is kept: $UNDO)"
@@ -129,7 +161,11 @@ if [ "$MODE" = undo ]; then
 	say "diffedit: last edit undone"
 	if [ -z "$QUIET" ]; then
 		git -C "$TOP" apply --stat "$UNDO" | sed 's/^/  /'
-		printf '  redo: git apply %s\n' "$UNDO"
+		if [ -e "$UNDO_STAGED" ]; then
+			printf '  redo: git apply --cached %s && git apply %s\n' "$UNDO" "$UNDO"
+		else
+			printf '  redo: git apply %s\n' "$UNDO"
+		fi
 	fi
 	exit 0
 fi
@@ -141,16 +177,18 @@ HARDEN=(-c color.ui=false -c core.quotePath=false -c diff.noprefix=false
 DIFFOPTS=(--patch --no-color --no-ext-diff --no-textconv --no-renames "-U$UCTX")
 
 # ---------------------------------------------------------------------------
-# 1. generate the unstaged diff
+# 1. generate the diff to edit
 
-git "${HARDEN[@]}" diff "${DIFFOPTS[@]}" \
+git "${HARDEN[@]}" diff "${DIFFOPTS[@]}" ${STAGED:+--cached} \
 	${PATHSPEC[@]+--} ${PATHSPEC[@]+"${PATHSPEC[@]}"} > "$TMP/src.raw" \
-	|| die 3 "could not generate the unstaged diff"
+	|| die 3 "could not generate the $WHERE diff"
 
-grep -q '^diff --cc ' "$TMP/src.raw" \
+grep -Eq '^(diff --cc |\* Unmerged path )' "$TMP/src.raw" \
 	&& die 3 "unmerged paths in the working tree; resolve the conflicts first"
-grep -q '^diff --git ' "$TMP/src.raw" \
-	|| die 1 "no unstaged changes to edit (untracked files appear only after git add -N)"
+if ! grep -q '^diff --git ' "$TMP/src.raw"; then
+	[ -n "$STAGED" ] && die 1 "no staged changes to edit (git add stages them)"
+	die 1 "no unstaged changes to edit (untracked files appear only after git add -N)"
+fi
 if grep -q '^--- "' "$TMP/src.raw" || grep -q '^+++ "' "$TMP/src.raw"; then
 	die 3 "a path in this diff needs quoting (special characters); not supported"
 fi
@@ -175,17 +213,17 @@ awk -v NOTES="$TMP/notes" '
 ' "$TMP/src.raw" > "$TMP/src.diff"
 
 grep -q '^diff --git ' "$TMP/src.diff" \
-	|| die 1 "nothing editable in the unstaged diff (only binary/submodule/symlink changes)"
+	|| die 1 "nothing editable in the $WHERE diff (only binary/submodule/symlink changes)"
 
 cp "$TMP/src.diff" "$ORIG"
 
 # ---------------------------------------------------------------------------
 # 2. reconstruct the pre-change files in a temp copy
 #
-# The buffer's pre-image is not the working tree but the tree *minus* the
-# unstaged changes (i.e. the index content of the touched paths). Copy the
+# The buffer's pre-image is the current content ("cur": the working tree,
+# or the index for --staged) *minus* the diff being edited. Copy the
 # touched files and strictly reverse-apply the diff we just generated; a
-# failure here means the tree changed between the diff and the copy.
+# failure here means things changed between the diff and the copy.
 
 # paths touched by the (sanitized) diff
 awk '
@@ -195,9 +233,14 @@ awk '
 
 mkdir -p "$TMP/cur"
 while IFS= read -r p; do
-	[ -f "$TOP/$p" ] || continue        # deleted in the tree: reverse-apply recreates it
-	mkdir -p "$TMP/cur/$(dirname "$p")"
-	cp -p "$TOP/$p" "$TMP/cur/$p"
+	if [ -n "$STAGED" ]; then
+		# not in the index (staged deletion): reverse-apply recreates it
+		git -C "$TOP" checkout-index --prefix="$TMP/cur/" -- "$p" 2>/dev/null || continue
+	else
+		[ -f "$TOP/$p" ] || continue    # deleted in the tree: reverse-apply recreates it
+		mkdir -p "$TMP/cur/$(dirname "$p")"
+		cp -p "$TOP/$p" "$TMP/cur/$p"
+	fi
 done < "$TMP/paths"
 
 cp -pR "$TMP/cur" "$TMP/base"
@@ -211,7 +254,11 @@ cp "$TMP/src.diff" "$TMP/body.diff"
 
 write_buffer() {  # $1 = path of an error file to quote, or ""
 	{
-		printf '# diffedit: unstaged changes (working tree vs index)\n# -> the saved buffer becomes your new unstaged diff\n'
+		if [ -n "$STAGED" ]; then
+			printf '# diffedit: staged changes (index vs HEAD)\n# -> the saved buffer becomes your new staged diff\n'
+		else
+			printf '# diffedit: unstaged changes (working tree vs index)\n# -> the saved buffer becomes your new unstaged diff\n'
+		fi
 		if [ -n "$1" ] && [ -s "$1" ]; then
 			printf '#\n# APPLY FAILED -- git said:\n'
 			sed 's/^/#     /' "$1"
@@ -223,11 +270,22 @@ write_buffer() {  # $1 = path of an error file to quote, or ""
 # Turn a '-' into a ' ' to keep that line after all, or a ' ' into '-' to
 # also delete it. Never delete or reword '-'/' ' lines otherwise: they must
 # keep matching the file as it was before your changes.
+EOF
+		if [ -n "$STAGED" ]; then
+			cat <<'EOF'
+# Deleting a whole hunk or file section REVERTS that change from the index
+# AND your working tree (the pre-edit diff is saved; see the final report).
+# '#' lines are ignored. Save and quit to rewrite the staged changes; quit
+# without saving (:q!), or save an empty file, to abort.
+EOF
+		else
+			cat <<'EOF'
 # Deleting a whole hunk or file section REVERTS that change from your
 # working tree (the pre-edit diff is saved; see the final report).
 # '#' lines are ignored. Save and quit to rewrite the working tree; quit
 # without saving (:q!), or save an empty file, to abort.
 EOF
+		fi
 		[ -s "$TMP/notes" ] && { printf '#\n'; cat "$TMP/notes"; }
 		cat "$TMP/body.diff"
 	} > "$BUFFER"
@@ -304,12 +362,12 @@ while :; do
 
 	grep -v '^#' "$BUFFER" > "$TMP/stripped"
 	if ! grep -q '^@@ ' "$TMP/stripped"; then
-		die 1 "empty patch aborts; refusing to revert all unstaged changes (git restore does that), nothing applied"
+		die 1 "empty patch aborts; $REFUSE, nothing applied"
 	fi
 	recount < "$TMP/stripped" > "$TMP/final.diff" \
 		|| die 3 "unparsable patch (stray line outside a hunk?); buffer kept: $BUFFER"
 	grep -q '^@@ ' "$TMP/final.diff" \
-		|| die 1 "the edited diff is empty; refusing to revert all unstaged changes (git restore does that), nothing applied"
+		|| die 1 "the edited diff is empty; $REFUSE, nothing applied"
 
 	rm -rf "$TMP/new"; cp -pR "$TMP/base" "$TMP/new"
 	if git -C "$TMP/new" apply --whitespace=nowarn "$TMP/final.diff" 2>"$TMP/apply.err"; then
@@ -324,10 +382,10 @@ done
 # ---------------------------------------------------------------------------
 # 5. land only the difference between the old and the new result
 #
-# cur/ is the tree as it stands, new/ is pre-image + edited patch. Their
-# diff is exactly what must change in the working tree: hunks the user did
-# not touch cancel out, deleted hunks/sections show up as reverts, and the
-# whole thing applies strictly or not at all.
+# cur/ is the content as it stands (working tree, or index for --staged),
+# new/ is pre-image + edited patch. Their diff is exactly what must change:
+# hunks the user did not touch cancel out, deleted hunks/sections show up
+# as reverts, and the whole thing applies strictly or not at all.
 
 git -C "$TMP" "${HARDEN[@]}" diff --no-index --no-color --no-ext-diff --no-renames cur new > "$TMP/inter.raw"
 case $? in 0|1) ;; *) die 3 "internal: could not diff the edited result against the tree" ;; esac
@@ -347,7 +405,21 @@ awk '
 	{ print }
 ' "$TMP/inter.raw" > "$TMP/inter.diff"
 
-if ! git -C "$TOP" apply --whitespace=nowarn "$TMP/inter.diff" 2>"$TMP/apply2.err"; then
+if [ -n "$STAGED" ]; then
+	# the delta lands in the index and in the working tree too, so the files
+	# on disk keep matching what is staged; both applies are strict, checked
+	# before touching either so a refusal writes nothing at all
+	if ! { git -C "$TOP" apply --cached --check --whitespace=nowarn "$TMP/inter.diff" \
+	    && git -C "$TOP" apply --check --whitespace=nowarn "$TMP/inter.diff"; } 2>"$TMP/apply2.err"; then
+		warn "the index changed while you were editing, or unstaged changes overlap the edited lines; nothing applied:"
+		sed 's/^/    /' "$TMP/apply2.err" >&2
+		die 2 "resolve the overlap or rerun git diffedit --staged (buffer kept: $BUFFER)"
+	fi
+	if ! { git -C "$TOP" apply --cached --whitespace=nowarn "$TMP/inter.diff" \
+	    && git -C "$TOP" apply --whitespace=nowarn "$TMP/inter.diff"; }; then
+		die 3 "internal: the apply failed after its --check passed (buffer kept: $BUFFER)"
+	fi
+elif ! git -C "$TOP" apply --whitespace=nowarn "$TMP/inter.diff" 2>"$TMP/apply2.err"; then
 	warn "the working tree changed while you were editing; nothing applied:"
 	sed 's/^/    /' "$TMP/apply2.err" >&2
 	die 2 "rerun git diffedit to pick up the current state (buffer kept: $BUFFER)"
@@ -357,11 +429,20 @@ fi
 # 6. report
 
 cp "$TMP/inter.diff" "$UNDO"
+if [ -n "$STAGED" ]; then : > "$UNDO_STAGED"; else rm -f "$UNDO_STAGED"; fi
 
-say "diffedit: working tree rewritten"
+if [ -n "$STAGED" ]; then
+	say "diffedit: staged changes rewritten"
+else
+	say "diffedit: working tree rewritten"
+fi
 if [ -z "$QUIET" ]; then
 	git -C "$TOP" apply --stat "$TMP/inter.diff" | sed 's/^/  /'
-	printf '  review: git diff        undo: git diffedit undo\n'
+	if [ -n "$STAGED" ]; then
+		printf '  review: git diff --staged        undo: git diffedit undo\n'
+	else
+		printf '  review: git diff        undo: git diffedit undo\n'
+	fi
 	printf '  pre-edit diff saved at: %s\n' "$ORIG"
 fi
 exit 0
